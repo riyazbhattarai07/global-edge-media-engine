@@ -1,0 +1,9 @@
+aws_region             = "us-east-1"
+environment            = "demo"
+project_name           = "media-engine"
+encoding_profiles      = ["480p", "720p", "1080p"] # add "2160p" for optional 4K
+use_fargate_spot       = true
+task_cpu               = 2048
+task_memory            = 4096
+storage_retention_days = 30
+input_ttl_days         = 7
