@@ -1,27 +1,124 @@
-name: Deploy
+# ─────────────────────────────────────────────────────────────────────────────
+# Terraform Deploy Workflow
+# Triggers:  push to main (auto-apply) + manual dispatch with optional plan-only
+# Auth:      AWS OIDC – no long-lived credentials stored as secrets
+# ─────────────────────────────────────────────────────────────────────────────
+name: "Terraform Deploy"
 
 on:
   push:
     branches: ["main"]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-deploy.yml"
+  workflow_dispatch:
+    inputs:
+      plan_only:
+        description: "Run plan only (no apply)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
 
 permissions:
   contents: read
-  id-token: write
+  id-token: write   # Required for OIDC
+  pull-requests: write
 
 concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: false
+  group: terraform-deploy-${{ github.ref }}
+  cancel-in-progress: false  # Never cancel in-flight deploys
+
+env:
+  TF_VERSION: "1.8.5"
+  TF_WORKING_DIR: "terraform/media-engine"
+  AWS_REGION: "us-east-1"
 
 jobs:
-  deploy:
+  terraform:
+    name: "Plan & Apply"
     runs-on: ubuntu-latest
+    environment: production
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-TerraformDeploy
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        continue-on-error: true
+
       - name: Terraform Init
-        run: terraform -chdir=terraform/media-engine init
+        id: init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=media-engine/${{ github.ref_name }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -no-color \
+            -input=false \
+            -var="environment=${{ github.ref_name == 'main' && 'prod' || 'dev' }}" \
+            -out=tfplan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 7
+
       - name: Terraform Apply
-        run: terraform -chdir=terraform/media-engine apply -auto-approve
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        if: |
+          github.ref == 'refs/heads/main' &&
+          github.event_name != 'workflow_dispatch' ||
+          (github.event_name == 'workflow_dispatch' && inputs.plan_only == 'false')
+        run: terraform apply -no-color -input=false tfplan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Capture Outputs
+        if: success()
+        id: outputs
+        run: |
+          terraform output -json > /tmp/tf_outputs.json
+          echo "ecr_url=$(terraform output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
+          echo "cloudfront_domain=$(terraform output -raw cloudfront_domain)" >> $GITHUB_OUTPUT
+          echo "state_machine_arn=$(terraform output -raw state_machine_arn)" >> $GITHUB_OUTPUT
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Post plan summary
+        if: always()
+        run: |
+          echo "## Terraform Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Format | ${{ steps.fmt.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Init   | ${{ steps.init.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Validate | ${{ steps.validate.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Plan   | ${{ steps.plan.outcome }} |" >> $GITHUB_STEP_SUMMARY
