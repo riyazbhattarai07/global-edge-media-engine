@@ -1,0 +1,2 @@
+# Lambda runtime includes boto3. Listed for local testing only.
+boto3>=1.34.0
